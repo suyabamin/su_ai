@@ -11,35 +11,34 @@ import {
 import { checkBackendHealth, streamChatMessage, ApiError } from '../lib/api';
 
 export const useChat = () => {
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<Conversation[]>(() => getStoredConversations());
+  const [activeId, setActiveId] = useState<string | null>(() => {
+    const stored = getStoredConversations();
+    const storedActive = getStoredActiveId();
+    if (storedActive && stored.some((c) => c.id === storedActive)) {
+      return storedActive;
+    }
+    return stored.length > 0 ? stored[0].id : null;
+  });
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [streamingMessage, setStreamingMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [backendHealth, setBackendHealth] = useState<BackendHealth | null>(null);
   const [theme, setTheme] = useState<ThemeMode>(getStoredTheme());
 
-  const activeIdRef = useRef<string | null>(null);
-  activeIdRef.current = activeId;
+  const activeIdRef = useRef<string | null>(activeId);
+  const conversationsRef = useRef<Conversation[]>(conversations);
 
-  const conversationsRef = useRef<Conversation[]>([]);
-  conversationsRef.current = conversations;
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const latestStreamingTextRef = useRef<string>('');
-
-  // Initialize from storage on mount
-  useEffect(() => {
-    const stored = getStoredConversations();
-    const storedActive = getStoredActiveId();
-    setConversations(stored);
-
-    if (storedActive && stored.some((c) => c.id === storedActive)) {
-      setActiveId(storedActive);
-    } else if (stored.length > 0) {
-      setActiveId(stored[0].id);
-    }
-  }, []);
 
   // Save conversations to storage (batched when conversations change, NOT per token)
   useEffect(() => {
@@ -77,8 +76,24 @@ export const useChat = () => {
   }, []);
 
   useEffect(() => {
-    refreshHealth();
-  }, [refreshHealth]);
+    let isMounted = true;
+    checkBackendHealth()
+      .then((health) => {
+        if (isMounted) setBackendHealth(health);
+      })
+      .catch(() => {
+        if (isMounted) {
+          setBackendHealth({
+            status: 'error',
+            configured: false,
+            version: '1.0.0',
+          });
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   const activeConversation = conversations.find((c) => c.id === activeId) || null;
 

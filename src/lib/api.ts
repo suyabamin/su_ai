@@ -1,6 +1,7 @@
 import type { BackendHealth } from '../types/chat';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// In unified Vercel deployment, API routes are relative (e.g. /api/chat)
+const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
 export interface ChatApiMessage {
   role: 'user' | 'assistant';
@@ -27,9 +28,9 @@ export class ApiError extends Error {
 export const checkBackendHealth = async (): Promise<BackendHealth> => {
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const timeoutId = setTimeout(() => controller.abort(), 6000);
 
-    const response = await fetch(`${API_BASE_URL}/health`, {
+    const response = await fetch(`${API_BASE_URL}/api/health`, {
       method: 'GET',
       headers: { Accept: 'application/json' },
       signal: controller.signal,
@@ -50,9 +51,9 @@ export const checkBackendHealth = async (): Promise<BackendHealth> => {
   } catch (err: unknown) {
     if (err instanceof ApiError) throw err;
     if (err instanceof Error && err.name === 'AbortError') {
-      throw new ApiError('Backend health check timed out.', 504);
+      throw new ApiError('SuAI service check timed out.', 504);
     }
-    throw new ApiError('Unable to connect to backend server.', 503);
+    throw new ApiError('Unable to connect to SuAI service.', 503);
   }
 };
 
@@ -74,7 +75,7 @@ export const streamChatMessage = async (
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/chat/stream`, {
+    response = await fetch(`${API_BASE_URL}/api/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -91,16 +92,17 @@ export const streamChatMessage = async (
       return '';
     }
     throw new ApiError(
-      'Unable to connect to the server. Please ensure the backend is running.',
+      'Unable to connect to SuAI service. Please check your network connection.',
       503
     );
   }
 
   if (!response.ok) {
-    let errorMessage = 'An error occurred while contacting the AI service.';
+    let errorMessage = 'An error occurred while contacting SuAI.';
     try {
       const errorJson = await response.json();
-      if (errorJson.detail) errorMessage = errorJson.detail;
+      if (errorJson.error) errorMessage = errorJson.error;
+      else if (errorJson.detail) errorMessage = errorJson.detail;
     } catch {
       errorMessage = `Server returned HTTP ${response.status}`;
     }
