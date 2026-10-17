@@ -1,5 +1,40 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { keyPool } from './keyPool.ts';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+
+function loadLocalEnv(): void {
+  const candidates = [
+    path.resolve(process.cwd(), '.env'),
+    path.resolve(process.cwd(), 'backend', '.env'),
+    path.resolve(process.cwd(), '..', '.env'),
+    path.resolve(process.cwd(), '..', 'backend', '.env'),
+  ];
+  for (const envPath of candidates) {
+    try {
+      if (fs.existsSync(envPath)) {
+        dotenv.config({ path: envPath, override: true });
+        const key = (process.env.GEMINI_API_KEY || '').trim();
+        if (key && !key.startsWith('your_')) {
+          break;
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  }
+}
+
+function hasConfiguredKey(): boolean {
+  loadLocalEnv();
+  const raw = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '').trim();
+  if (!raw) return false;
+  const parsed = raw
+    .split(/[,;\r\n]+/)
+    .map((k) => k.trim())
+    .filter((k) => k && !k.startsWith('your_') && k.length > 10);
+  return parsed.length > 0;
+}
 
 function handleNodeRequest(req: IncomingMessage, res: ServerResponse) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -16,8 +51,7 @@ function handleNodeRequest(req: IncomingMessage, res: ServerResponse) {
   res.end(
     JSON.stringify({
       status: 'healthy',
-      configured: keyPool.hasAnyKey(),
-      poolSize: keyPool.getPoolSize(),
+      configured: hasConfiguredKey(),
       version: '1.0.0',
     })
   );
@@ -38,8 +72,7 @@ function handleWebRequest(req: Request): Response {
   return new Response(
     JSON.stringify({
       status: 'healthy',
-      configured: keyPool.hasAnyKey(),
-      poolSize: keyPool.getPoolSize(),
+      configured: hasConfiguredKey(),
       version: '1.0.0',
     }),
     {

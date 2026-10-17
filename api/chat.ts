@@ -1,6 +1,103 @@
 import type { IncomingMessage, ServerResponse } from 'http';
 import { GoogleGenAI } from '@google/genai';
-import { keyPool } from './keyPool.ts';
+import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+
+function loadLocalEnv(): void {
+  const candidates = [
+    path.resolve(process.cwd(), '.env'),
+    path.resolve(process.cwd(), 'backend', '.env'),
+    path.resolve(process.cwd(), '..', '.env'),
+    path.resolve(process.cwd(), '..', 'backend', '.env'),
+  ];
+  for (const envPath of candidates) {
+    try {
+      if (fs.existsSync(envPath)) {
+        dotenv.config({ path: envPath, override: true });
+        const key = (process.env.GEMINI_API_KEY || '').trim();
+        if (key && !key.startsWith('your_')) {
+          break;
+        }
+      }
+    } catch {
+      // Ignore filesystem access errors in serverless environments
+    }
+  }
+}
+
+loadLocalEnv();
+
+interface KeyStatus {
+  key: string;
+  cooldownUntil: number;
+  failCount: number;
+}
+
+class GeminiKeyPool {
+  private keys: KeyStatus[] = [];
+  private lastRefreshed = 0;
+
+  constructor() {
+    this.refresh();
+  }
+
+  public refresh(force = false): void {
+    const now = Date.now();
+    if (!force && now - this.lastRefreshed < 2000 && this.keys.length > 0) {
+      return;
+    }
+    this.lastRefreshed = now;
+
+    loadLocalEnv();
+
+    const raw = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || '').trim();
+    if (!raw) {
+      this.keys = [];
+      return;
+    }
+
+    const parsed = raw
+      .split(/[,;\r\n]+/)
+      .map((k) => k.trim())
+      .filter((k) => k && !k.startsWith('your_') && k.length > 10);
+
+    const uniqueKeys = Array.from(new Set(parsed));
+    const existingMap = new Map(this.keys.map((k) => [k.key, k]));
+    this.keys = uniqueKeys.map((k) => existingMap.get(k) || { key: k, cooldownUntil: 0, failCount: 0 });
+  }
+
+  public getAvailableKeys(): string[] {
+    this.refresh();
+    const now = Date.now();
+    const active = this.keys.filter((k) => k.cooldownUntil <= now);
+    const inCooldown = this.keys.filter((k) => k.cooldownUntil > now);
+    return [...active, ...inCooldown].map((k) => k.key);
+  }
+
+  public markQuotaExceeded(key: string, cooldownSeconds = 60): void {
+    const item = this.keys.find((k) => k.key === key);
+    if (item) {
+      item.failCount += 1;
+      item.cooldownUntil = Date.now() + cooldownSeconds * 1000;
+    }
+  }
+
+  public markSuccess(key: string): void {
+    const item = this.keys.find((k) => k.key === key);
+    if (item) {
+      item.failCount = 0;
+      item.cooldownUntil = 0;
+    }
+  }
+
+  public hasAnyKey(): boolean {
+    this.refresh();
+    return this.keys.length > 0;
+  }
+}
+
+const keyPool = new GeminiKeyPool();
 
 const SYSTEM_INSTRUCTION = `You are SuAI, an intelligent, helpful, knowledgeable, and polite modern AI assistant. Your product and assistant name is strictly SuAI.
 
@@ -36,32 +133,17 @@ function getCandidateModels(customModel?: string): string[] {
     }
   }
 
-  // gemini-3.8-flash has active quota in Google AI Studio
   const preferred = (process.env.GEMINI_MODEL || 'gemini-3.8-flash').trim();
   if (preferred && !models.includes(preferred)) {
     models.push(preferred);
   }
 
-  // Fallbacks
   for (const m of ['gemini-3.8-flash', 'gemini-2.5-flash']) {
     if (!models.includes(m)) {
       models.push(m);
     }
   }
   return models;
-}
-
-function parseJsonBody(body: any): ChatRequestBody {
-  if (!body) return {};
-  if (typeof body === 'object') return body;
-  if (typeof body === 'string') {
-    try {
-      return JSON.parse(body);
-    } catch {
-      return {};
-    }
-  }
-  return {};
 }
 
 function setCorsHeaders(res: ServerResponse) {
@@ -87,206 +169,222 @@ async function handleNodeRequest(req: IncomingMessage & { body?: any }, res: Ser
     return res.end(JSON.stringify({ error: 'Method not allowed' }));
   }
 
-  // Parse body if not pre-parsed by framework
-  let body: ChatRequestBody = {};
-  if (req.body) {
-    body = parseJsonBody(req.body);
-  } else {
-    try {
-      const chunks: Buffer[] = [];
-      for await (const chunk of req) {
-        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  try {
+    let body: ChatRequestBody = {};
+    if (req.body && typeof req.body === 'object') {
+      body = req.body;
+    } else if (typeof req.body === 'string') {
+      try {
+        body = JSON.parse(req.body);
+      } catch {
+        body = {};
       }
-      const raw = Buffer.concat(chunks).toString('utf-8');
-      body = parseJsonBody(raw);
-    } catch {
+    } else if (!req.readableEnded && !req.complete) {
+      try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+        }
+        const raw = Buffer.concat(chunks).toString('utf-8');
+        if (raw.trim()) {
+          body = JSON.parse(raw);
+        }
+      } catch {
+        res.statusCode = 400;
+        res.setHeader('Content-Type', 'application/json');
+        return res.end(JSON.stringify({ error: 'Failed to parse JSON request body.' }));
+      }
+    }
+
+    const rawMessage = body.message;
+    if (!rawMessage || typeof rawMessage !== 'string' || !rawMessage.trim()) {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'application/json');
-      return res.end(JSON.stringify({ error: 'Failed to read request body.' }));
+      return res.end(JSON.stringify({ error: 'Message cannot be empty.' }));
     }
-  }
 
-  const rawMessage = body.message;
-  if (!rawMessage || typeof rawMessage !== 'string' || !rawMessage.trim()) {
-    res.statusCode = 400;
-    res.setHeader('Content-Type', 'application/json');
-    return res.end(JSON.stringify({ error: 'Message cannot be empty.' }));
-  }
+    const message = rawMessage.trim();
+    if (message.length > MAX_MESSAGE_LENGTH) {
+      res.statusCode = 400;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(
+        JSON.stringify({ error: `Message exceeds maximum allowed length of ${MAX_MESSAGE_LENGTH} characters.` })
+      );
+    }
 
-  const message = rawMessage.trim();
-  if (message.length > MAX_MESSAGE_LENGTH) {
-    res.statusCode = 400;
-    res.setHeader('Content-Type', 'application/json');
-    return res.end(
-      JSON.stringify({ error: `Message exceeds maximum allowed length of ${MAX_MESSAGE_LENGTH} characters.` })
-    );
-  }
+    const candidateKeys = keyPool.getAvailableKeys();
+    if (candidateKeys.length === 0) {
+      res.statusCode = 503;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(
+        JSON.stringify({
+          error:
+            'SuAI is not configured with an API key on the server. Please add GEMINI_API_KEY in your Vercel Project Settings → Environment Variables.',
+        })
+      );
+    }
 
-  const candidateKeys = keyPool.getAvailableKeys();
-  if (candidateKeys.length === 0) {
-    res.statusCode = 503;
-    res.setHeader('Content-Type', 'application/json');
-    return res.end(
-      JSON.stringify({
-        error: 'SuAI is not configured with an API key on the server. Please configure GEMINI_API_KEY in your .env file or Vercel settings.',
-      })
-    );
-  }
+    // Validate and sanitize history
+    const rawHistory = Array.isArray(body.history) ? body.history : [];
+    const validHistory = rawHistory
+      .filter(
+        (m): m is ChatHistoryMessage =>
+          Boolean(m) &&
+          (m.role === 'user' || m.role === 'assistant') &&
+          typeof m.content === 'string' &&
+          m.content.trim().length > 0
+      )
+      .slice(-MAX_HISTORY_MESSAGES);
 
-  // Validate and sanitize history
-  const rawHistory = Array.isArray(body.history) ? body.history : [];
-  const validHistory = rawHistory
-    .filter(
-      (m): m is ChatHistoryMessage =>
-        Boolean(m) &&
-        (m.role === 'user' || m.role === 'assistant') &&
-        typeof m.content === 'string' &&
-        m.content.trim().length > 0
-    )
-    .slice(-MAX_HISTORY_MESSAGES);
+    // Build contents array for Google Gen AI SDK
+    const contents = validHistory.map((m) => ({
+      role: m.role === 'user' ? 'user' : 'model',
+      parts: [{ text: m.content }],
+    }));
+    contents.push({
+      role: 'user',
+      parts: [{ text: message }],
+    });
 
-  // Build contents array for Google Gen AI SDK
-  const contents = validHistory.map((m) => ({
-    role: m.role === 'user' ? 'user' : 'model',
-    parts: [{ text: m.content }],
-  }));
-  contents.push({
-    role: 'user',
-    parts: [{ text: message }],
-  });
+    const candidateModels = getCandidateModels(body.model);
 
-  const candidateModels = getCandidateModels(body.model);
+    // Initialize SSE streaming response
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
 
-  // Initialize SSE streaming response
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
+    let clientDisconnected = false;
+    req.on('close', () => {
+      clientDisconnected = true;
+    });
 
-  let clientDisconnected = false;
-  req.on('close', () => {
-    clientDisconnected = true;
-  });
+    let streamSucceeded = false;
+    let lastError: any = null;
 
-  let streamSucceeded = false;
-  let lastError: any = null;
-
-  // Key-Pool Rotation & Model Failover Loop
-  keyLoop: for (const apiKey of candidateKeys) {
-    if (clientDisconnected) break;
-    const ai = new GoogleGenAI({ apiKey });
-
-    for (const modelToUse of candidateModels) {
+    // Key-Pool Rotation & Model Failover Loop
+    keyLoop: for (const apiKey of candidateKeys) {
       if (clientDisconnected) break;
-      try {
-        const responseStream = await ai.models.generateContentStream({
-          model: modelToUse,
-          contents,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            temperature: 0.7,
-          },
-        });
+      const ai = new GoogleGenAI({ apiKey });
 
-        let hasYielded = false;
-        for await (const chunk of responseStream) {
-          if (clientDisconnected) break;
+      for (const modelToUse of candidateModels) {
+        if (clientDisconnected) break;
+        try {
+          const responseStream = await ai.models.generateContentStream({
+            model: modelToUse,
+            contents,
+            config: {
+              systemInstruction: SYSTEM_INSTRUCTION,
+              temperature: 0.7,
+            },
+          });
 
-          let chunkText = '';
-          if (chunk.text) {
-            chunkText = chunk.text;
-          } else if (chunk.candidates?.[0]?.content?.parts) {
-            chunkText = chunk.candidates[0].content.parts
-              .map((p: any) => p.text || '')
-              .join('');
-          }
+          let hasYielded = false;
+          for await (const chunk of responseStream) {
+            if (clientDisconnected) break;
 
-          if (chunkText) {
-            hasYielded = true;
-            res.write(`data: ${JSON.stringify({ chunk: chunkText })}\n\n`);
-            if (typeof (res as any).flush === 'function') {
-              (res as any).flush();
+            let chunkText = '';
+            if (chunk.text) {
+              chunkText = chunk.text;
+            } else if (chunk.candidates?.[0]?.content?.parts) {
+              chunkText = chunk.candidates[0].content.parts
+                .map((p: any) => p.text || '')
+                .join('');
+            }
+
+            if (chunkText) {
+              hasYielded = true;
+              res.write(`data: ${JSON.stringify({ chunk: chunkText })}\n\n`);
+              if (typeof (res as any).flush === 'function') {
+                (res as any).flush();
+              }
             }
           }
-        }
 
-        if (!hasYielded && !clientDisconnected) {
-          const fallback = 'SuAI was unable to produce a response. Please rephrase or try another prompt.';
-          res.write(`data: ${JSON.stringify({ chunk: fallback })}\n\n`);
-        }
+          if (!hasYielded && !clientDisconnected) {
+            const fallback = 'SuAI was unable to produce a response. Please rephrase or try another prompt.';
+            res.write(`data: ${JSON.stringify({ chunk: fallback })}\n\n`);
+          }
 
-        if (!clientDisconnected) {
-          res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-        }
-        keyPool.markSuccess(apiKey);
-        streamSucceeded = true;
-        break keyLoop;
-      } catch (err: any) {
-        lastError = err;
-        const errMsg = err?.message || String(err);
-        const lower = errMsg.toLowerCase();
+          if (!clientDisconnected) {
+            res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+          }
+          keyPool.markSuccess(apiKey);
+          streamSucceeded = true;
+          break keyLoop;
+        } catch (err: any) {
+          lastError = err;
+          const errMsg = err?.message || String(err);
+          const lower = errMsg.toLowerCase();
 
-        const isQuota =
-          err?.code === 429 ||
-          err?.status === 429 ||
-          err?.status === 'RESOURCE_EXHAUSTED' ||
-          lower.includes('429') ||
-          lower.includes('quota') ||
-          lower.includes('resource_exhausted');
+          const isQuota =
+            err?.code === 429 ||
+            err?.status === 429 ||
+            err?.status === 'RESOURCE_EXHAUSTED' ||
+            lower.includes('429') ||
+            lower.includes('quota') ||
+            lower.includes('resource_exhausted');
 
-        if (isQuota) {
-          keyPool.markQuotaExceeded(apiKey, 60);
-          // Try next API key from pool immediately!
+          if (isQuota) {
+            keyPool.markQuotaExceeded(apiKey, 60);
+            break; // Try next key in keyLoop
+          }
+
+          const isNotFound =
+            err?.status === 404 ||
+            err?.code === 404 ||
+            err?.status === 'NOT_FOUND' ||
+            lower.includes('not found') ||
+            lower.includes('not available');
+
+          if (isNotFound) {
+            continue; // try next candidate model
+          }
+
+          const isAuthError =
+            err?.status === 401 ||
+            err?.status === 403 ||
+            lower.includes('api_key') ||
+            lower.includes('permission');
+
+          if (isAuthError) {
+            keyPool.markQuotaExceeded(apiKey, 3600);
+            break;
+          }
+
           break;
         }
-
-        const isNotFound =
-          err?.status === 404 ||
-          err?.code === 404 ||
-          err?.status === 'NOT_FOUND' ||
-          lower.includes('not found') ||
-          lower.includes('not available');
-
-        if (isNotFound) {
-          continue; // try next candidate model
-        }
-
-        const isAuthError =
-          err?.status === 401 ||
-          err?.status === 403 ||
-          lower.includes('api_key') ||
-          lower.includes('permission');
-
-        if (isAuthError) {
-          keyPool.markQuotaExceeded(apiKey, 3600);
-          break; // Try next key
-        }
-
-        break;
       }
     }
-  }
 
-  if (!streamSucceeded && !clientDisconnected) {
-    const errMsg = lastError?.message || String(lastError);
-    const lower = errMsg.toLowerCase();
-    let userFriendlyError = 'SuAI encountered an issue communicating with the AI service. Please try again.';
+    if (!streamSucceeded && !clientDisconnected) {
+      const errMsg = lastError?.message || String(lastError);
+      const lower = errMsg.toLowerCase();
+      let userFriendlyError = 'SuAI encountered an issue communicating with the AI service. Please try again.';
 
-    if (lastError?.status === 429 || lower.includes('quota') || lower.includes('resource_exhausted')) {
-      userFriendlyError = 'All configured AI service keys have reached their quota. Please try again in a moment or add another API key.';
-    } else if (lastError?.status === 401 || lastError?.status === 403 || lower.includes('api_key') || lower.includes('permission')) {
-      userFriendlyError = 'AI service authentication failed. Please verify your server API key configuration.';
-    } else if (lastError?.status === 404 || lower.includes('not found')) {
-      userFriendlyError = 'The configured AI model was not found or is currently unavailable.';
+      if (lastError?.status === 429 || lower.includes('quota') || lower.includes('resource_exhausted')) {
+        userFriendlyError = 'All configured AI service keys have reached their quota. Please try again in a moment or add another API key.';
+      } else if (lastError?.status === 401 || lastError?.status === 403 || lower.includes('api_key') || lower.includes('permission')) {
+        userFriendlyError = 'AI service authentication failed. Please verify your GEMINI_API_KEY in Vercel settings.';
+      } else if (lastError?.status === 404 || lower.includes('not found')) {
+        userFriendlyError = 'The configured AI model was not found or is currently unavailable.';
+      }
+
+      res.write(`data: ${JSON.stringify({ error: userFriendlyError })}\n\n`);
     }
 
-    res.write(`data: ${JSON.stringify({ error: userFriendlyError })}\n\n`);
-  }
-
-  if (!clientDisconnected) {
-    res.end();
+    if (!clientDisconnected) {
+      res.end();
+    }
+  } catch (topLevelError: any) {
+    console.error('[API Server Error]:', topLevelError);
+    if (!res.headersSent) {
+      res.statusCode = 500;
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ error: `Server error: ${topLevelError?.message || 'Internal error'}` }));
+    }
   }
 }
 
@@ -312,185 +410,193 @@ async function handleWebRequest(req: Request): Promise<Response> {
     });
   }
 
-  let body: ChatRequestBody = {};
   try {
-    body = await req.json();
-  } catch {
-    return new Response(JSON.stringify({ error: 'Invalid JSON request payload.' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
+    let body: ChatRequestBody = {};
+    try {
+      body = await req.json();
+    } catch {
+      return new Response(JSON.stringify({ error: 'Invalid JSON request payload.' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const rawMessage = body.message;
+    if (!rawMessage || typeof rawMessage !== 'string' || !rawMessage.trim()) {
+      return new Response(JSON.stringify({ error: 'Message cannot be empty.' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const message = rawMessage.trim();
+    if (message.length > MAX_MESSAGE_LENGTH) {
+      return new Response(
+        JSON.stringify({ error: `Message exceeds maximum allowed length of ${MAX_MESSAGE_LENGTH} characters.` }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const candidateKeys = keyPool.getAvailableKeys();
+    if (candidateKeys.length === 0) {
+      return new Response(
+        JSON.stringify({
+          error:
+            'SuAI is not configured with an API key on the server. Please add GEMINI_API_KEY in your Vercel Project Settings → Environment Variables.',
+        }),
+        { status: 503, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    const rawHistory = Array.isArray(body.history) ? body.history : [];
+    const validHistory = rawHistory
+      .filter(
+        (m): m is ChatHistoryMessage =>
+          Boolean(m) &&
+          (m.role === 'user' || m.role === 'assistant') &&
+          typeof m.content === 'string' &&
+          m.content.trim().length > 0
+      )
+      .slice(-MAX_HISTORY_MESSAGES);
+
+    const contents = validHistory.map((m) => ({
+      role: m.role === 'user' ? 'user' : 'model',
+      parts: [{ text: m.content }],
+    }));
+    contents.push({
+      role: 'user',
+      parts: [{ text: message }],
     });
-  }
 
-  const rawMessage = body.message;
-  if (!rawMessage || typeof rawMessage !== 'string' || !rawMessage.trim()) {
-    return new Response(JSON.stringify({ error: 'Message cannot be empty.' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
+    const candidateModels = getCandidateModels(body.model);
+    const encoder = new TextEncoder();
 
-  const message = rawMessage.trim();
-  if (message.length > MAX_MESSAGE_LENGTH) {
-    return new Response(
-      JSON.stringify({ error: `Message exceeds maximum allowed length of ${MAX_MESSAGE_LENGTH} characters.` }),
-      { status: 400, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
+    const stream = new ReadableStream({
+      async start(controller) {
+        let streamSucceeded = false;
+        let lastError: any = null;
 
-  const candidateKeys = keyPool.getAvailableKeys();
-  if (candidateKeys.length === 0) {
-    return new Response(
-      JSON.stringify({
-        error: 'SuAI is not configured with an API key on the server. Please configure GEMINI_API_KEY in your .env file or Vercel settings.',
-      }),
-      { status: 503, headers: { 'Content-Type': 'application/json' } }
-    );
-  }
+        keyLoop: for (const apiKey of candidateKeys) {
+          const ai = new GoogleGenAI({ apiKey });
 
-  const rawHistory = Array.isArray(body.history) ? body.history : [];
-  const validHistory = rawHistory
-    .filter(
-      (m): m is ChatHistoryMessage =>
-        Boolean(m) &&
-        (m.role === 'user' || m.role === 'assistant') &&
-        typeof m.content === 'string' &&
-        m.content.trim().length > 0
-    )
-    .slice(-MAX_HISTORY_MESSAGES);
+          for (const modelToUse of candidateModels) {
+            try {
+              const responseStream = await ai.models.generateContentStream({
+                model: modelToUse,
+                contents,
+                config: {
+                  systemInstruction: SYSTEM_INSTRUCTION,
+                  temperature: 0.7,
+                },
+              });
 
-  const contents = validHistory.map((m) => ({
-    role: m.role === 'user' ? 'user' : 'model',
-    parts: [{ text: m.content }],
-  }));
-  contents.push({
-    role: 'user',
-    parts: [{ text: message }],
-  });
+              let hasYielded = false;
+              for await (const chunk of responseStream) {
+                let chunkText = '';
+                if (chunk.text) {
+                  chunkText = chunk.text;
+                } else if (chunk.candidates?.[0]?.content?.parts) {
+                  chunkText = chunk.candidates[0].content.parts
+                    .map((p: any) => p.text || '')
+                    .join('');
+                }
 
-  const candidateModels = getCandidateModels(body.model);
-  const encoder = new TextEncoder();
-
-  const stream = new ReadableStream({
-    async start(controller) {
-      let streamSucceeded = false;
-      let lastError: any = null;
-
-      keyLoop: for (const apiKey of candidateKeys) {
-        const ai = new GoogleGenAI({ apiKey });
-
-        for (const modelToUse of candidateModels) {
-          try {
-            const responseStream = await ai.models.generateContentStream({
-              model: modelToUse,
-              contents,
-              config: {
-                systemInstruction: SYSTEM_INSTRUCTION,
-                temperature: 0.7,
-              },
-            });
-
-            let hasYielded = false;
-            for await (const chunk of responseStream) {
-              let chunkText = '';
-              if (chunk.text) {
-                chunkText = chunk.text;
-              } else if (chunk.candidates?.[0]?.content?.parts) {
-                chunkText = chunk.candidates[0].content.parts
-                  .map((p: any) => p.text || '')
-                  .join('');
+                if (chunkText) {
+                  hasYielded = true;
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({ chunk: chunkText })}\n\n`));
+                }
               }
 
-              if (chunkText) {
-                hasYielded = true;
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ chunk: chunkText })}\n\n`));
+              if (!hasYielded) {
+                const fallback = 'SuAI was unable to produce a response. Please rephrase or try another prompt.';
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ chunk: fallback })}\n\n`));
               }
-            }
 
-            if (!hasYielded) {
-              const fallback = 'SuAI was unable to produce a response. Please rephrase or try another prompt.';
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ chunk: fallback })}\n\n`));
-            }
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
+              keyPool.markSuccess(apiKey);
+              streamSucceeded = true;
+              break keyLoop;
+            } catch (err: any) {
+              lastError = err;
+              const errMsg = err?.message || String(err);
+              const lower = errMsg.toLowerCase();
 
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ done: true })}\n\n`));
-            keyPool.markSuccess(apiKey);
-            streamSucceeded = true;
-            break keyLoop;
-          } catch (err: any) {
-            lastError = err;
-            const errMsg = err?.message || String(err);
-            const lower = errMsg.toLowerCase();
+              const isQuota =
+                err?.code === 429 ||
+                err?.status === 429 ||
+                err?.status === 'RESOURCE_EXHAUSTED' ||
+                lower.includes('429') ||
+                lower.includes('quota') ||
+                lower.includes('resource_exhausted');
 
-            const isQuota =
-              err?.code === 429 ||
-              err?.status === 429 ||
-              err?.status === 'RESOURCE_EXHAUSTED' ||
-              lower.includes('429') ||
-              lower.includes('quota') ||
-              lower.includes('resource_exhausted');
+              if (isQuota) {
+                keyPool.markQuotaExceeded(apiKey, 60);
+                break;
+              }
 
-            if (isQuota) {
-              keyPool.markQuotaExceeded(apiKey, 60);
+              const isNotFound =
+                err?.status === 404 ||
+                err?.code === 404 ||
+                err?.status === 'NOT_FOUND' ||
+                lower.includes('not found') ||
+                lower.includes('not available');
+
+              if (isNotFound) {
+                continue;
+              }
+
+              const isAuthError =
+                err?.status === 401 ||
+                err?.status === 403 ||
+                lower.includes('api_key') ||
+                lower.includes('permission');
+
+              if (isAuthError) {
+                keyPool.markQuotaExceeded(apiKey, 3600);
+                break;
+              }
+
               break;
             }
-
-            const isNotFound =
-              err?.status === 404 ||
-              err?.code === 404 ||
-              err?.status === 'NOT_FOUND' ||
-              lower.includes('not found') ||
-              lower.includes('not available');
-
-            if (isNotFound) {
-              continue;
-            }
-
-            const isAuthError =
-              err?.status === 401 ||
-              err?.status === 403 ||
-              lower.includes('api_key') ||
-              lower.includes('permission');
-
-            if (isAuthError) {
-              keyPool.markQuotaExceeded(apiKey, 3600);
-              break;
-            }
-
-            break;
           }
         }
-      }
 
-      if (!streamSucceeded) {
-        const errMsg = lastError?.message || String(lastError);
-        const lower = errMsg.toLowerCase();
-        let userFriendlyError = 'SuAI encountered an issue communicating with the AI service. Please try again.';
+        if (!streamSucceeded) {
+          const errMsg = lastError?.message || String(lastError);
+          const lower = errMsg.toLowerCase();
+          let userFriendlyError = 'SuAI encountered an issue communicating with the AI service. Please try again.';
 
-        if (lastError?.status === 429 || lower.includes('quota') || lower.includes('resource_exhausted')) {
-          userFriendlyError = 'All configured AI service keys have reached their quota. Please try again in a moment or add another API key.';
-        } else if (lastError?.status === 401 || lastError?.status === 403 || lower.includes('api_key') || lower.includes('permission')) {
-          userFriendlyError = 'AI service authentication failed. Please verify your server API key configuration.';
-        } else if (lastError?.status === 404 || lower.includes('not found')) {
-          userFriendlyError = 'The configured AI model was not found or is currently unavailable.';
+          if (lastError?.status === 429 || lower.includes('quota') || lower.includes('resource_exhausted')) {
+            userFriendlyError = 'All configured AI service keys have reached their quota. Please try again in a moment or add another API key.';
+          } else if (lastError?.status === 401 || lastError?.status === 403 || lower.includes('api_key') || lower.includes('permission')) {
+            userFriendlyError = 'AI service authentication failed. Please verify your GEMINI_API_KEY in Vercel settings.';
+          } else if (lastError?.status === 404 || lower.includes('not found')) {
+            userFriendlyError = 'The configured AI model was not found or is currently unavailable.';
+          }
+
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: userFriendlyError })}\n\n`));
         }
 
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: userFriendlyError })}\n\n`));
-      }
+        controller.close();
+      },
+    });
 
-      controller.close();
-    },
-  });
-
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
-      'Connection': 'keep-alive',
-      'X-Accel-Buffering': 'no',
-      'Access-Control-Allow-Origin': '*',
-    },
-  });
+    return new Response(stream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+        'Access-Control-Allow-Origin': '*',
+      },
+    });
+  } catch (topLevelError: any) {
+    return new Response(
+      JSON.stringify({ error: `Server error: ${topLevelError?.message || 'Internal error'}` }),
+      { status: 500, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
 }
 
 /**
